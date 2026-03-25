@@ -7,8 +7,6 @@ from datetime import datetime, timezone
 
 import psycopg2
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS btc_markets (
     id SERIAL PRIMARY KEY,
@@ -103,6 +101,7 @@ def run_agent():
     return json.loads(result.stdout)
 
 def main():
+    DATABASE_URL = os.environ.get("DATABASE_URL")
     if not DATABASE_URL:
         print("ERROR: DATABASE_URL environment variable not set", file=sys.stderr)
         sys.exit(1)
