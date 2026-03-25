@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-pip install requests psycopg2-binary
+pip install requests psycopg2-binary flask
 
-python polymarket_db_ingest.py
+python app.py
