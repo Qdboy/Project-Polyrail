@@ -50,14 +50,21 @@ def ingestion_worker(DATABASE_URL):
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
+# Start the ingestion worker when the module loads (works with gunicorn)
+DATABASE_URL = os.environ.get("DATABASE_URL")
+if DATABASE_URL:
+    worker = threading.Thread(
+        target=ingestion_worker, args=(DATABASE_URL,), daemon=True, name="ingestion-worker"
+    )
+    worker.start()
+    print(f"[{datetime.now(timezone.utc).isoformat()}] Ingestion worker started")
+else:
+    print("WARNING: DATABASE_URL not set, ingestion worker not started", file=sys.stderr)
+
+
 if __name__ == "__main__":
-    DATABASE_URL = os.environ.get("DATABASE_URL")
     if not DATABASE_URL:
         print("ERROR: DATABASE_URL environment variable not set", file=sys.stderr)
         sys.exit(1)
 
-    worker = threading.Thread(target=ingestion_worker, args=(DATABASE_URL,), daemon=True, name="ingestion-worker")
-    worker.start()
-    print(f"[{datetime.now(timezone.utc).isoformat()}] Ingestion worker started")
-
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))

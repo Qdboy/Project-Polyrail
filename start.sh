@@ -1,6 +1,6 @@
 #!/bin/bash
 set -euo pipefail
 
-pip install requests psycopg2-binary flask
+pip install -r requirements.txt
 
-python app.py
+gunicorn --bind 0.0.0.0:${PORT:-8000} --workers 1 --threads 2 app:app

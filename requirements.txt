@@ -1,1 +1,4 @@
 requests
+psycopg2-binary
+flask
+gunicorn
