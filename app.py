@@ -11,7 +11,6 @@ from polymarket_db_ingest import run_agent, ingest, ensure_table
 
 app = Flask(__name__)
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
 POLL_INTERVAL_SECONDS = int(os.environ.get("POLL_INTERVAL_SECONDS", "60"))
 
 
@@ -20,7 +19,7 @@ def health():
     return jsonify({"status": "ok"}), 200
 
 
-def ingestion_worker():
+def ingestion_worker(DATABASE_URL):
     """Background thread: connects to Postgres and polls Polymarket on a schedule."""
     conn = psycopg2.connect(DATABASE_URL)
     ensure_table(conn)
@@ -52,11 +51,12 @@ def ingestion_worker():
 
 
 if __name__ == "__main__":
+    DATABASE_URL = os.environ.get("DATABASE_URL")
     if not DATABASE_URL:
         print("ERROR: DATABASE_URL environment variable not set", file=sys.stderr)
         sys.exit(1)
 
-    worker = threading.Thread(target=ingestion_worker, daemon=True, name="ingestion-worker")
+    worker = threading.Thread(target=ingestion_worker, args=(DATABASE_URL,), daemon=True, name="ingestion-worker")
     worker.start()
     print(f"[{datetime.now(timezone.utc).isoformat()}] Ingestion worker started")
 
