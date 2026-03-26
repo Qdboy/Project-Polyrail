@@ -1,15 +1,10 @@
 """
 market_ingest.py — Collect time-series snapshots for all tracked markets.
 
-Responsibilities:
-  - Read market_ids from tracked_markets
-  - Fetch fresh data from Polymarket API
-  - Insert rows into market_snapshots (never overwrite or deduplicate)
-  - Clean/validate numeric values
+Updated: replaces 'spread' with 'confidence' and 'imbalance' metrics.
 
-Usage:
-  from market_ingest import run_ingest
-  count = run_ingest(conn)
+  confidence = max(price_yes, price_no)  — 0.5 = uncertain, 1.0 = certain
+  imbalance  = price_yes - price_no      — directional bias (-1 to +1)
 """
 
 import logging
@@ -30,16 +25,32 @@ CREATE TABLE IF NOT EXISTS market_snapshots (
     price_no    DOUBLE PRECISION,
     volume      DOUBLE PRECISION,
     liquidity   DOUBLE PRECISION,
-    spread      DOUBLE PRECISION
+    spread      DOUBLE PRECISION,
+    confidence  DOUBLE PRECISION,
+    imbalance   DOUBLE PRECISION
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_market_ts
     ON market_snapshots (market_id, timestamp);
+"""
+
+ALTER_SNAPSHOTS_SQL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_snapshots' AND column_name='confidence') THEN
+        ALTER TABLE market_snapshots ADD COLUMN confidence DOUBLE PRECISION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_snapshots' AND column_name='imbalance') THEN
+        ALTER TABLE market_snapshots ADD COLUMN imbalance DOUBLE PRECISION;
+    END IF;
+END
+$$;
 """
 
 
 def ensure_snapshots_table(conn):
     with conn.cursor() as cur:
         cur.execute(CREATE_SNAPSHOTS_SQL)
+        cur.execute(ALTER_SNAPSHOTS_SQL)
     conn.commit()
 
 
@@ -53,7 +64,6 @@ def _safe_float(val):
 
 
 def _parse_prices(outcome_prices_str):
-    """Parse outcomePrices JSON string like '["0.75","0.25"]' into (yes, no)."""
     if not outcome_prices_str:
         return None, None
     try:
@@ -69,10 +79,21 @@ def _parse_prices(outcome_prices_str):
 
 
 def _compute_spread(price_yes, price_no):
-    """spread = abs(price_yes - (1 - price_no))"""
     if price_yes is None or price_no is None:
         return None
     return abs(price_yes - (1.0 - price_no))
+
+
+def _compute_confidence(price_yes, price_no):
+    if price_yes is None or price_no is None:
+        return None
+    return max(price_yes, price_no)
+
+
+def _compute_imbalance(price_yes, price_no):
+    if price_yes is None or price_no is None:
+        return None
+    return price_yes - price_no
 
 
 def run_ingest(conn):
@@ -90,7 +111,6 @@ def run_ingest(conn):
         logger.info("No tracked markets, skipping ingest")
         return 0
 
-    # Fetch markets in bulk (paginated)
     fetched = {}
     offset = 0
     limit = 100
@@ -106,7 +126,6 @@ def run_ingest(conn):
             if mid in tracked_ids:
                 fetched[mid] = m
         offset += limit
-        # If we've found all tracked markets, stop early
         if len(fetched) >= len(tracked_ids):
             break
 
@@ -120,19 +139,21 @@ def run_ingest(conn):
         for mid, m in fetched.items():
             price_yes, price_no = _parse_prices(m.get("outcomePrices"))
             if price_yes is None:
-                logger.debug("Skipping %s — no price data", mid)
                 continue
 
             volume = _safe_float(m.get("volume"))
             liquidity = _safe_float(m.get("liquidity"))
             spread = _compute_spread(price_yes, price_no)
+            confidence = _compute_confidence(price_yes, price_no)
+            imbalance = _compute_imbalance(price_yes, price_no)
 
             cur.execute(
                 """
-                INSERT INTO market_snapshots (market_id, timestamp, price_yes, price_no, volume, liquidity, spread)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO market_snapshots
+                    (market_id, timestamp, price_yes, price_no, volume, liquidity, spread, confidence, imbalance)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
-                (mid, now, price_yes, price_no, volume, liquidity, spread),
+                (mid, now, price_yes, price_no, volume, liquidity, spread, confidence, imbalance),
             )
             inserted += 1
 

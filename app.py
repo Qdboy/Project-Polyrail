@@ -1,10 +1,13 @@
 """
-app.py — Flask application with background workers for market discovery, ingestion, and finalization.
+app.py — Flask application with background workers.
 
 Workers:
-  1. Discovery worker — runs every 5 minutes
-  2. Ingest worker — runs every 30 seconds
-  3. Finalize worker — runs every 2 minutes
+  1. Discovery — every 5 minutes (includes parsing)
+  2. Ingest — every 30 seconds
+  3. Finalize — every 2 minutes
+  4. BTC Price — every 30 seconds
+  5. Resolution — every 2 minutes (after finalize)
+  6. Parser backfill — once on startup
 """
 
 import os
@@ -15,11 +18,15 @@ import threading
 from datetime import datetime, timezone
 
 import psycopg2
-from flask import Flask, jsonify
+from flask import Flask, jsonify, Response
 
 from market_discovery import run_discovery, ensure_tracked_table
 from market_ingest import run_ingest, ensure_snapshots_table
 from market_finalize import run_finalize, ensure_outcomes_table
+from btc_price_ingest import run_btc_price_ingest, ensure_btc_prices_table
+from market_resolution import run_resolution, ensure_resolution_columns
+from market_parser import ensure_parsed_columns, backfill_unparsed
+from data_exporter import export_csv_to_string
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,6 +39,8 @@ app = Flask(__name__)
 DISCOVERY_INTERVAL = int(os.environ.get("DISCOVERY_INTERVAL_SECONDS", "300"))
 INGEST_INTERVAL = int(os.environ.get("INGEST_INTERVAL_SECONDS", "30"))
 FINALIZE_INTERVAL = int(os.environ.get("FINALIZE_INTERVAL_SECONDS", "120"))
+BTC_PRICE_INTERVAL = int(os.environ.get("BTC_PRICE_INTERVAL_SECONDS", "30"))
+RESOLUTION_INTERVAL = int(os.environ.get("RESOLUTION_INTERVAL_SECONDS", "120"))
 
 
 def _get_conn():
@@ -45,7 +54,6 @@ def health():
 
 @app.route("/stats")
 def stats():
-    """Quick stats endpoint."""
     try:
         conn = _get_conn()
         with conn.cursor() as cur:
@@ -57,20 +65,50 @@ def stats():
             snapshots = cur.fetchone()[0]
             cur.execute("SELECT COUNT(*) FROM market_outcomes")
             outcomes = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM btc_prices")
+            btc_prices = cur.fetchone()[0]
+            cur.execute("SELECT COUNT(*) FROM market_outcomes WHERE true_outcome IS NOT NULL")
+            resolved = cur.fetchone()[0]
+            cur.execute("SELECT price, timestamp FROM btc_prices ORDER BY timestamp DESC LIMIT 1")
+            latest_btc = cur.fetchone()
         conn.close()
         return jsonify({
             "tracked_markets": total_tracked,
             "active_markets": active,
             "total_snapshots": snapshots,
             "finalized_markets": outcomes,
+            "resolved_with_btc": resolved,
+            "btc_price_records": btc_prices,
+            "latest_btc_price": latest_btc[0] if latest_btc else None,
+            "latest_btc_time": str(latest_btc[1]) if latest_btc else None,
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/export/csv")
+def export_csv():
+    """Download the full training dataset as CSV."""
+    try:
+        conn = _get_conn()
+        csv_string, count = export_csv_to_string(conn)
+        conn.close()
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        filename = f"btc_markets_dataset_{timestamp}.csv"
+
+        return Response(
+            csv_string,
+            mimetype="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/export")
 def export_data():
-    """Trigger a dataset export and return the path."""
+    """Legacy export endpoint."""
     from data_cleaner import export_clean_dataset
     try:
         conn = _get_conn()
@@ -83,7 +121,6 @@ def export_data():
 
 
 def _worker_loop(name, func, interval):
-    """Generic worker loop with reconnection."""
     conn = _get_conn()
     while True:
         try:
@@ -100,17 +137,24 @@ def _worker_loop(name, func, interval):
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
-    # Initialize tables on startup
     init_conn = _get_conn()
     ensure_tracked_table(init_conn)
     ensure_snapshots_table(init_conn)
     ensure_outcomes_table(init_conn)
+    ensure_btc_prices_table(init_conn)
+    ensure_parsed_columns(init_conn)
+    ensure_resolution_columns(init_conn)
+
+    # Backfill parsing for any existing unparsed markets
+    backfill_unparsed(init_conn)
     init_conn.close()
 
     for name, func, interval in [
         ("discovery", run_discovery, DISCOVERY_INTERVAL),
         ("ingest", run_ingest, INGEST_INTERVAL),
         ("finalize", run_finalize, FINALIZE_INTERVAL),
+        ("btc_price", run_btc_price_ingest, BTC_PRICE_INTERVAL),
+        ("resolution", run_resolution, RESOLUTION_INTERVAL),
     ]:
         t = threading.Thread(target=_worker_loop, args=(name, func, interval), daemon=True, name=name)
         t.start()

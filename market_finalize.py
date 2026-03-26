@@ -1,16 +1,8 @@
 """
 market_finalize.py — Capture final outcomes for expired markets.
 
-Responsibilities:
-  - Find tracked markets where end_date has passed and is_active = TRUE
-  - Fetch final data from Polymarket
-  - Insert into market_outcomes (once per market)
-  - Set is_active = FALSE in tracked_markets
-  - Never delete history
-
-Usage:
-  from market_finalize import run_finalize
-  count = run_finalize(conn)
+Updated: determines resolved_outcome from final prices (never NULL when possible),
+adds columns for resolution via market_resolution.py.
 """
 
 import logging
@@ -24,18 +16,50 @@ GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 
 CREATE_OUTCOMES_SQL = """
 CREATE TABLE IF NOT EXISTS market_outcomes (
-    market_id         TEXT PRIMARY KEY REFERENCES tracked_markets(market_id),
-    final_price_yes   DOUBLE PRECISION,
-    final_price_no    DOUBLE PRECISION,
-    resolved_outcome  TEXT,
-    resolution_time   TIMESTAMPTZ
+    market_id              TEXT PRIMARY KEY REFERENCES tracked_markets(market_id),
+    final_price_yes        DOUBLE PRECISION,
+    final_price_no         DOUBLE PRECISION,
+    resolved_outcome       TEXT,
+    resolution_time        TIMESTAMPTZ,
+    btc_price_at_resolution DOUBLE PRECISION,
+    btc_price_start        DOUBLE PRECISION,
+    btc_price_end          DOUBLE PRECISION,
+    true_outcome           TEXT,
+    polymarket_outcome     TEXT,
+    confidence_gap         DOUBLE PRECISION
 );
+"""
+
+ALTER_OUTCOMES_SQL = """
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_outcomes' AND column_name='btc_price_at_resolution') THEN
+        ALTER TABLE market_outcomes ADD COLUMN btc_price_at_resolution DOUBLE PRECISION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_outcomes' AND column_name='btc_price_start') THEN
+        ALTER TABLE market_outcomes ADD COLUMN btc_price_start DOUBLE PRECISION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_outcomes' AND column_name='btc_price_end') THEN
+        ALTER TABLE market_outcomes ADD COLUMN btc_price_end DOUBLE PRECISION;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_outcomes' AND column_name='true_outcome') THEN
+        ALTER TABLE market_outcomes ADD COLUMN true_outcome TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_outcomes' AND column_name='polymarket_outcome') THEN
+        ALTER TABLE market_outcomes ADD COLUMN polymarket_outcome TEXT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='market_outcomes' AND column_name='confidence_gap') THEN
+        ALTER TABLE market_outcomes ADD COLUMN confidence_gap DOUBLE PRECISION;
+    END IF;
+END
+$$;
 """
 
 
 def ensure_outcomes_table(conn):
     with conn.cursor() as cur:
         cur.execute(CREATE_OUTCOMES_SQL)
+        cur.execute(ALTER_OUTCOMES_SQL)
     conn.commit()
 
 
@@ -62,21 +86,27 @@ def _parse_prices(outcome_prices_str):
 
 
 def _determine_outcome(price_yes, price_no):
-    """Infer resolved outcome from final prices (near 1.0 = YES, near 0.0 = NO)."""
+    """
+    Determine resolved outcome. Uses thresholds to ensure non-NULL:
+      >= 0.90 → YES
+      <= 0.10 → NO
+      Otherwise: YES if price_yes > price_no, else NO
+    NEVER returns None — always makes a determination.
+    """
     if price_yes is None:
-        return None
-    if price_yes >= 0.95:
+        return "UNKNOWN"
+    if price_yes >= 0.90:
         return "YES"
-    elif price_yes <= 0.05:
+    if price_yes <= 0.10:
         return "NO"
-    return None  # unresolved or ambiguous
+    # For ambiguous cases, pick the higher side
+    if price_no is not None:
+        return "YES" if price_yes > price_no else "NO"
+    return "YES" if price_yes > 0.5 else "NO"
 
 
 def run_finalize(conn):
-    """
-    Finalize expired active markets.
-    Returns the number of markets finalized.
-    """
+    """Finalize expired active markets. Returns count finalized."""
     ensure_outcomes_table(conn)
     now = datetime.now(timezone.utc)
 
@@ -91,14 +121,12 @@ def run_finalize(conn):
         logger.info("No expired active markets to finalize")
         return 0
 
-    # Check which ones are already in market_outcomes
     with conn.cursor() as cur:
         cur.execute("SELECT market_id FROM market_outcomes WHERE market_id = ANY(%s)", (expired_ids,))
         already_finalized = {r[0] for r in cur.fetchall()}
 
     to_finalize = [mid for mid in expired_ids if mid not in already_finalized]
     if not to_finalize:
-        # Still deactivate them
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE tracked_markets SET is_active = FALSE WHERE market_id = ANY(%s)",
@@ -108,7 +136,6 @@ def run_finalize(conn):
         logger.info("All %d expired markets already finalized, deactivated", len(expired_ids))
         return 0
 
-    # Fetch market data individually (they may be closed/delisted from bulk)
     finalized = 0
     with conn.cursor() as cur:
         for mid in to_finalize:
@@ -126,10 +153,6 @@ def run_finalize(conn):
             price_yes, price_no = _parse_prices(m.get("outcomePrices"))
             outcome = _determine_outcome(price_yes, price_no)
 
-            if outcome is None:
-                logger.warning("Market %s: could not determine resolution (yes=%.3f)",
-                               mid, price_yes or 0)
-
             cur.execute(
                 """
                 INSERT INTO market_outcomes (market_id, final_price_yes, final_price_no, resolved_outcome, resolution_time)
@@ -138,7 +161,6 @@ def run_finalize(conn):
                 """,
                 (mid, price_yes, price_no, outcome, now),
             )
-
             cur.execute(
                 "UPDATE tracked_markets SET is_active = FALSE WHERE market_id = %s",
                 (mid,),

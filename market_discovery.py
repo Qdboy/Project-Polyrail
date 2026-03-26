@@ -1,16 +1,15 @@
 """
 market_discovery.py — Discover and track Bitcoin-related Polymarket markets.
 
+Now integrates market_parser to parse questions on discovery.
+
 Responsibilities:
   - Fetch markets from Polymarket Gamma API
   - Filter by BTC/Bitcoin keywords, not closed, ending within 24h, liquidity > threshold
   - INSERT new markets into tracked_markets
   - UPDATE last_seen for existing markets
+  - Parse new market questions into structured data (strike, up/down)
   - Never delete markets once added
-
-Usage:
-  from market_discovery import run_discovery
-  new_ids, all_ids = run_discovery(conn)
 """
 
 import logging
@@ -21,16 +20,21 @@ import requests
 logger = logging.getLogger(__name__)
 
 GAMMA_URL = "https://gamma-api.polymarket.com/markets"
-MIN_LIQUIDITY = 1000  # configurable threshold
+MIN_LIQUIDITY = 1000
 
 CREATE_TRACKED_MARKETS_SQL = """
 CREATE TABLE IF NOT EXISTS tracked_markets (
-    market_id   TEXT PRIMARY KEY,
-    question    TEXT,
-    end_date    TIMESTAMPTZ,
-    first_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now(),
-    is_active   BOOLEAN NOT NULL DEFAULT TRUE
+    market_id         TEXT PRIMARY KEY,
+    question          TEXT,
+    end_date          TIMESTAMPTZ,
+    first_seen        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    is_active         BOOLEAN NOT NULL DEFAULT TRUE,
+    market_type       TEXT,
+    strike_price      DOUBLE PRECISION,
+    comparison_type   TEXT,
+    parsed_start_time TIMESTAMPTZ,
+    parsed_end_time   TIMESTAMPTZ
 );
 """
 
@@ -38,6 +42,28 @@ CREATE TABLE IF NOT EXISTS tracked_markets (
 def ensure_tracked_table(conn):
     with conn.cursor() as cur:
         cur.execute(CREATE_TRACKED_MARKETS_SQL)
+        # Add columns if table existed without them
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tracked_markets' AND column_name='market_type') THEN
+                    ALTER TABLE tracked_markets ADD COLUMN market_type TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tracked_markets' AND column_name='strike_price') THEN
+                    ALTER TABLE tracked_markets ADD COLUMN strike_price DOUBLE PRECISION;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tracked_markets' AND column_name='comparison_type') THEN
+                    ALTER TABLE tracked_markets ADD COLUMN comparison_type TEXT;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tracked_markets' AND column_name='parsed_start_time') THEN
+                    ALTER TABLE tracked_markets ADD COLUMN parsed_start_time TIMESTAMPTZ;
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='tracked_markets' AND column_name='parsed_end_time') THEN
+                    ALTER TABLE tracked_markets ADD COLUMN parsed_end_time TIMESTAMPTZ;
+                END IF;
+            END
+            $$;
+        """)
     conn.commit()
 
 
@@ -73,7 +99,6 @@ def _fetch_candidate_markets():
             except ValueError:
                 continue
 
-            # Stop paginating once we pass the 24h window
             if end_dt > cutoff:
                 return candidates
 
@@ -102,11 +127,11 @@ def _fetch_candidate_markets():
 
 def run_discovery(conn):
     """
-    Discover BTC markets and upsert into tracked_markets.
-
-    Returns:
-        (new_ids, all_tracked_ids) — lists of market_id strings
+    Discover BTC markets, upsert into tracked_markets, and parse new ones.
+    Returns (new_ids, all_tracked_ids).
     """
+    from market_parser import parse_market_question
+
     ensure_tracked_table(conn)
     candidates = _fetch_candidate_markets()
     logger.info("Discovered %d candidate markets", len(candidates))
@@ -114,7 +139,6 @@ def run_discovery(conn):
     new_ids = []
     with conn.cursor() as cur:
         for c in candidates:
-            # Try INSERT, on conflict just update last_seen
             cur.execute(
                 """
                 INSERT INTO tracked_markets (market_id, question, end_date, first_seen, last_seen, is_active)
@@ -126,23 +150,43 @@ def run_discovery(conn):
                 (c["market_id"], c["question"], c["end_date"]),
             )
             row = cur.fetchone()
-            if row and row[0]:  # xmax=0 means INSERT happened
-                new_ids.append(c["market_id"])
+            if row and row[0]:
+                new_ids.append(c)
 
-        # Fetch all tracked ids
         cur.execute("SELECT market_id FROM tracked_markets")
         all_ids = [r[0] for r in cur.fetchall()]
 
     conn.commit()
-    logger.info("New markets added: %d | Total tracked: %d", len(new_ids), len(all_ids))
-    return new_ids, all_ids
+
+    # Parse new markets immediately
+    for c in new_ids:
+        try:
+            parsed = parse_market_question(c["question"])
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE tracked_markets
+                    SET market_type = %s, strike_price = %s, comparison_type = %s,
+                        parsed_start_time = %s, parsed_end_time = %s
+                    WHERE market_id = %s
+                    """,
+                    (parsed["market_type"], parsed["strike_price"],
+                     parsed["comparison_type"], parsed["parsed_start_time"],
+                     parsed["parsed_end_time"], c["market_id"]),
+                )
+            conn.commit()
+        except Exception as e:
+            logger.error("Failed to parse market %s: %s", c["market_id"], e)
+
+    new_market_ids = [c["market_id"] for c in new_ids]
+    logger.info("New markets added: %d | Total tracked: %d", len(new_market_ids), len(all_ids))
+    return new_market_ids, all_ids
 
 
 if __name__ == "__main__":
     import os, psycopg2
     logging.basicConfig(level=logging.INFO)
-    db_url = os.environ["DATABASE_URL"]
-    conn = psycopg2.connect(db_url)
+    conn = psycopg2.connect(os.environ["DATABASE_URL"])
     new_ids, all_ids = run_discovery(conn)
     print(f"New: {len(new_ids)}, Total tracked: {len(all_ids)}")
     conn.close()
